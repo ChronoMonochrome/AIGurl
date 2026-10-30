@@ -51,16 +51,36 @@ def clean_text_for_tts(text):
   return text.strip()
 
 
-async def generate_audio_file(text, filename):
-  communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural")
+def get_tts_parameters(sentence):
+  """Динамически настраивает скорость и тон голоса в зависимости от знаков в тексте."""
+  rate = "+0%"
+  pitch = "+0Hz"
+
+  if "!" in sentence:
+    pitch = "+3Hz"  # Чувыше тональность для эмоций
+    rate = "+5%"  # Чуть быстрее для энергии
+  elif "?" in sentence:
+    pitch = "+2Hz"  # Интонация вопроса
+    rate = "+0%"
+  elif len(sentence) < 15:
+    pitch = "+1Hz"  # Короткие реплики звучат живее
+
+  return rate, pitch
+
+
+async def generate_audio_file(text, filename, rate, pitch):
+  communicate = edge_tts.Communicate(
+      text, "ru-RU-SvetlanaNeural", rate=rate, pitch=pitch
+  )
   await communicate.save(filename)
 
 
 def download_worker(index, sentence, filename, t_created):
-  """Параллельное скачивание конкретного предложения"""
+  """Параллельное скачивание конкретного предложения с динамической озвучкой"""
   try:
     t_start = time.perf_counter()
-    asyncio.run(generate_audio_file(sentence, filename))
+    rate, pitch = get_tts_parameters(sentence)
+    asyncio.run(generate_audio_file(sentence, filename, rate, pitch))
     tts_duration = time.perf_counter() - t_start
 
     with audio_lock:
@@ -77,7 +97,6 @@ def download_worker(index, sentence, filename, t_created):
 def playback_worker(total_sentences):
   """Воспроизведение строго по порядку (index 0, 1, 2...)"""
   for i in range(total_sentences):
-    # Ждем, пока нужное предложение скачается
     while True:
       with audio_lock:
         if i in audio_ready:
@@ -151,14 +170,17 @@ def stream_to_tts(prompt_text):
             {
                 "role": "system",
                 "content": (
-                    "Ты — милая диалоговая виртуальная девушка. Отвечай"
-                    " разговорным русским языком, кратко, вежливо и без"
-                    " смайликов и эмодзи в тексте."
+                    "Ты — милая и живая виртуальная девушка. Отвечай"
+                    " разговорным русским языком. Используй короткие и длинные"
+                    " предложения вперемешку, а также живые эмоции и междометия"
+                    " (ой!, хм..., вау, ух ты). Активно используй"
+                    " вопросительные (?) и восклицательные (!) знаки, так как от"
+                    " них зависит интонация речи."
                 ),
             },
             {"role": "user", "content": prompt_text},
         ],
-        temperature=0.7,
+        temperature=0.8,  # Чуть выше креативность для более разнообразных ответов
         stream=True,
     )
 
@@ -195,16 +217,13 @@ def stream_to_tts(prompt_text):
         " загрузка..."
     )
 
-    # Очищаем словарь перед новым запуском
     audio_ready.clear()
 
-    # Запускаем поток упорядоченного воспроизведения
     player_thread = threading.Thread(
         target=playback_worker, args=(total_sentences,), daemon=True
     )
     player_thread.start()
 
-    # Запускаем параллельное скачивание с сохранением индексов
     download_threads = []
     for i, sentence in enumerate(sentences):
       filename = f"audio_part_{i}.mp3"
