@@ -99,7 +99,7 @@ CHARACTERS_CONFIG = {
         },
         "flirty": {
             "filename": "flirty.mp3",
-            "text": "[playful, cheerful] Знаешь, я тут подумала... [chuckles] Если ты думаешь, что мои старые мемы — это весело, то ты еще ничего не видел."
+            "text": "[playful, cheerful] Знаешь, я тут подумала..."
         },
         "surprised": {
             "filename": "surprised.mp3",
