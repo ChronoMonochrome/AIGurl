@@ -18,8 +18,8 @@ parser.add_argument(
 parser.add_argument(
     "--max-sentences",
     type=int,
-    default=1,
-    help="Максимальное количество фраз для генерации (по умолчанию 1 для тестирования)"
+    default=None,
+    help="Максимальное количество фраз для генерации (в локальном режиме по умолчанию 1)"
 )
 args = parser.parse_args()
 
@@ -35,14 +35,16 @@ os.environ["https_proxy"] = "socks5://localhost:2080"
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
-# Выбираем режим подключения и клиент httpx
+# Автоматически устанавливаем лимит в 1 фразу для локального режима, если он не был задан явно
 if args.local:
     COLAB_URL = "http://localhost:8000"
+    if args.max_sentences is None:
+        args.max_sentences = 1
     print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
     http_client = httpx.Client(timeout=180.0)
 else:
     COLAB_URL = ""
-    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences})")
+    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences if args.max_sentences is not None else 'нет'})")
     http_client = httpx.Client(
         proxy="socks5://localhost:2080",
         timeout=45.0,
@@ -231,19 +233,18 @@ def stream_to_tts(prompt_text):
         if buffer.strip():
             cleaned = clean_text_for_tts(buffer.strip())
             if cleaned:
-                        sentences.append(cleaned)
+                sentences.append(cleaned)
 
-        # Ограничиваем количество фраз согласно --max-sentences
-        if args.max_sentences and len(sentences) > args.max_sentences:
+        # Ограничиваем количество фраз согласно --max-sentences (если задано)
+        if args.max_sentences is not None and len(sentences) > args.max_sentences:
             if args.max_sentences == 1 and len(sentences) > 0:
-                # Берем фразу из середины списка, оставляя список длиной 1
                 mid_idx = len(sentences) // 2
                 sentences = [sentences[mid_idx]]
             else:
                 sentences = sentences[:args.max_sentences]
 
         total_sentences = len(sentences)
-        print(f"📝 Сгенерировано фраз для отправки: {total_sentences} (лимит: {args.max_sentences}). Потоковая передача...")
+        print(f"📝 Сгенерировано фраз для отправки: {total_sentences} (лимит: {args.max_sentences if args.max_sentences is not None else 'нет'}). Потоковая передача...")
 
         audio_ready.clear()
 
