@@ -1,6 +1,4 @@
 .env
-*.wav
-*.mp3
 vocab.txt
 *.safetensors
 *.onnx
