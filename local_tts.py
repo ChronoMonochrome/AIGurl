@@ -120,18 +120,6 @@ CHARACTERS_CONFIG = {
         "moan_cheerful": {
             "filename": "moan_cheerful.mp3",
             "text": "[sensual, whispers] Ох... [moan] как же это приятно... [sighs] Продолжай, не останавливайся... [gasp] мне так хорошо с тобой..."
-        },
-        "moan_excited": {
-            "filename": "moan_excited.mp3",
-            "text": "[intimate, breathless, fast] Ах... [moan] да... [gasp] быстрее... [pant] м-мх... [moan] еще, пожалуйста... [gasp] ах! [pant] ах! [pant] да! [pant] кончаю!"
-        },
-        "moan_fast": {
-            "filename": "moan_fast.mp3",
-            "text": "[moan, rapid, intense] А! [moan] А! [pant] А! [pant] А! [pant] А! [pant]  А! [moan] А! [pant] А! [pant] А! [pant] А! [pant]"
-        },
-        "moan_very_fast": {
-            "filename": "moan_very_fast.mp3",
-            "text": "[moan, rapid, intense] Ай! [moan,  rapid, intense] А! [pant,  rapid, intense] А! [pant,  rapid, intense, breathless] А! [pant, rapid] А! [pant, very fast]  А-а!"
         }
     }
 }
