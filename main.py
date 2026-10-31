@@ -54,15 +54,21 @@ os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 if args.local:
     COLAB_URL = "http://localhost:8000"
     WS_URL = "ws://localhost:8000/ws/voice"
+    print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
     http_client = httpx.Client(timeout=180.0)
 else:
-    COLAB_URL = ""
-    WS_URL = ""
+    # Читаем статический адрес из .env
+    COLAB_URL = os.environ.get("COLAB_URL")
+    if not COLAB_URL:
+        raise ValueError("❌ Ошибка: Не найден COLAB_URL в файле .env. Укажите статический адрес ngrok.")
+    COLAB_URL = COLAB_URL.rstrip("/")
+    WS_URL = COLAB_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/voice"
+
+    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences})")
     http_client = httpx.Client(
         proxy="socks5://localhost:2080",
         timeout=45.0,
     )
-
 client = Groq(api_key=api_key, http_client=http_client)
 
 PUNCTUATION_PATTERN = re.compile(r"([.!?\n]+)")
