@@ -1,5 +1,6 @@
 import os
 import re
+import argparse
 import subprocess
 import threading
 import time
@@ -7,20 +8,46 @@ from dotenv import load_dotenv
 import httpx
 from groq import Groq
 
+# Парсим аргументы командной строки
+parser = argparse.ArgumentParser(description="Клиент для голосового ассистента Virtual Girlfriend")
+parser.add_argument(
+    "--local",
+    action="store_true",
+    help="Использовать локальный сервер TTS (http://localhost:8000) вместо Google Colab"
+)
+parser.add_argument(
+    "--max-sentences",
+    type=int,
+    default=1,
+    help="Максимальное количество фраз для генерации (по умолчанию 1 для тестирования)"
+)
+args = parser.parse_args()
+
 load_dotenv()
 api_key = os.environ.get("GROQ_API_KEY")
 
 if not api_key:
     raise ValueError("❌ Ошибка: Не найден GROQ_API_KEY. Проверьте файл .env.")
 
-# Настраиваем прокси для локальной сети
+# Настраиваем прокси для локальной сети и исключаем localhost
 os.environ["http_proxy"] = "socks5://localhost:2080"
 os.environ["https_proxy"] = "socks5://localhost:2080"
+os.environ["no_proxy"] = "localhost,127.0.0.1"
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
-http_client = httpx.Client(
-    proxy="socks5://localhost:2080",
-    timeout=45.0,
-)
+# Выбираем режим подключения и клиент httpx
+if args.local:
+    COLAB_URL = "http://localhost:8000"
+    print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
+    http_client = httpx.Client(timeout=180.0)
+else:
+    COLAB_URL = ""
+    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences})")
+    http_client = httpx.Client(
+        proxy="socks5://localhost:2080",
+        timeout=45.0,
+    )
+
 client = Groq(api_key=api_key, http_client=http_client)
 
 PUNCTUATION_PATTERN = re.compile(r"([.!?\n]+)")
@@ -28,11 +55,8 @@ PUNCTUATION_PATTERN = re.compile(r"([.!?\n]+)")
 audio_ready = {}
 audio_lock = threading.Lock()
 
-# Семафор ограничивает количество одновременных запросов в Colab (максимум 2)
+# Семафор ограничивает количество одновременных запросов
 tunnel_semaphore = threading.Semaphore(2)
-
-# ПОСТОЯННЫЙ СТАТИЧЕСКИЙ АДРЕС COLAB
-COLAB_URL = ""
 
 def clean_text_for_tts(text):
     emoji_pattern = re.compile("["
@@ -73,14 +97,11 @@ def clean_text_for_tts(text):
     elif text.endswith('.'):
         text = text[:-1] + "…"
 
-    # ХАК: Добавляем слово "ня" в конце каждой фразы,
-    # чтобы F5-TTS сбрасывал всю «театральность» обрыва на него (Colab его отрежет)
-    text = text + ", ня!"
-
-    return text
+    # Добавляем пробельный хвостик для корректного сброса слогов в F5-TTS
+    return text + "   "
 
 def download_worker(index, sentence, filename, t_created):
-    """Запрос к F5-TTS с защитой от перегрузки туннеля через семафор"""
+    """Запрос к TTS с защитой через семафор"""
     with tunnel_semaphore:
         try:
             t_start = time.perf_counter()
@@ -90,7 +111,7 @@ def download_worker(index, sentence, filename, t_created):
                 f"{COLAB_URL}/tts",
                 json={"text": sentence},
                 headers=headers,
-                timeout=40.0
+                timeout=180.0 if args.local else 40.0
             )
 
             if response.status_code == 200:
@@ -106,9 +127,9 @@ def download_worker(index, sentence, filename, t_created):
                         "tts_duration": tts_duration
                     }
             else:
-                print(f"⚠️ Ошибка от Colab TTS для фразы #{index}: {response.text}")
+                print(f"⚠️ Ошибка от TTS сервера для фразы #{index}: {response.text}")
         except Exception as e:
-            print(f"⚠️ Ошибка соединения с Colab для фразы #{index}: {e}")
+            print(f"⚠️ Ошибка соединения с сервером для фразы #{index}: {e}")
 
 def playback_worker(total_sentences):
     """Потоковое воспроизведение фраз по мере их готовности"""
@@ -135,7 +156,7 @@ def playback_worker(total_sentences):
         )
         play_duration = time.perf_counter() - t_play_start
 
-        print(f"⏱️ [Метрика] Ожидание: {queue_wait_duration:.2f}с | F5-TTS генерация: {tts_duration:.2f}с | Воспроизведение: {play_duration:.2f}с | Текст: '{sentence}'")
+        print(f"⏱️ [Метрика] Ожидание: {queue_wait_duration:.2f}с | Генерация: {tts_duration:.2f}с | Воспроизведение: {play_duration:.2f}с | Текст: '{sentence}'")
 
         if os.path.exists(filename):
             os.remove(filename)
@@ -210,10 +231,19 @@ def stream_to_tts(prompt_text):
         if buffer.strip():
             cleaned = clean_text_for_tts(buffer.strip())
             if cleaned:
-                sentences.append(cleaned)
+                        sentences.append(cleaned)
+
+        # Ограничиваем количество фраз согласно --max-sentences
+        if args.max_sentences and len(sentences) > args.max_sentences:
+            if args.max_sentences == 1 and len(sentences) > 0:
+                # Берем фразу из середины списка, оставляя список длиной 1
+                mid_idx = len(sentences) // 2
+                sentences = [sentences[mid_idx]]
+            else:
+                sentences = sentences[:args.max_sentences]
 
         total_sentences = len(sentences)
-        print(f"📝 Сгенерировано фраз: {total_sentences}. Потоковая передача...")
+        print(f"📝 Сгенерировано фраз для отправки: {total_sentences} (лимит: {args.max_sentences}). Потоковая передача...")
 
         audio_ready.clear()
 
