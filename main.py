@@ -4,6 +4,11 @@ import argparse
 import subprocess
 import threading
 import time
+import asyncio
+import json
+import websockets
+import sounddevice as sd
+import numpy as np
 from dotenv import load_dotenv
 import httpx
 from groq import Groq
@@ -18,20 +23,20 @@ parser.add_argument(
 parser.add_argument(
     "--max-sentences",
     type=int,
-    default=None,
-    help="Максимальное количество фраз для генерации (в локальном режиме по умолчанию 1)"
+    default=1,  # <--- По умолчанию 1 фраза для мгновенного ответа без задержек!
+    help="Максимальное количество фраз для генерации"
 )
 parser.add_argument(
     "--prompt",
     type=str,
-    default="Привет! Расскажи короткую историю о том, как ты провела день.",
-    help="Текст сообщения для отправки ассистенту"
+    default=None,
+    help="Текст сообщения (если не задан, включается дуплексный режим с микрофоном)"
 )
 parser.add_argument(
     "--ref",
     type=str,
     default=None,
-    help="Принудительная эмоция/референс (excited, sad, ironic, flirty, surprised, angry, tired, passionate, moan_cheerful, moan_excited, moan_fast, moan_very_fast)"
+    help="Принудительная эмоция/референс"
 )
 args = parser.parse_args()
 
@@ -48,13 +53,11 @@ os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
 if args.local:
     COLAB_URL = "http://localhost:8000"
-    if args.max_sentences is None:
-        args.max_sentences = 1
-    print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
+    WS_URL = "ws://localhost:8000/ws/voice"
     http_client = httpx.Client(timeout=180.0)
 else:
     COLAB_URL = ""
-    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences if args.max_sentences is not None else 'нет'})")
+    WS_URL = ""
     http_client = httpx.Client(
         proxy="socks5://localhost:2080",
         timeout=45.0,
@@ -69,6 +72,33 @@ audio_ready = {}
 audio_lock = threading.Lock()
 tunnel_semaphore = threading.Semaphore(2)
 
+SAMPLE_RATE = 16000
+BLOCK_DURATION = 0.5
+BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_DURATION)
+SILENCE_THRESHOLD = 0.0008
+PAUSE_LIMIT_BLOCKS = 3  # Уменьшили до 3 блоков (1.5 сек паузы) для быстрой реакции
+is_recording = True
+audio_queue = asyncio.Queue()
+
+assistant_is_speaking = False
+
+# История диалога для сохранения контекста беседы
+chat_history = [
+    {
+        "role": "system",
+        "content": (
+            "Ты — живая, характерная девушка со своими заморочками, а не послушный чат-бот. Твой парень — Денис. "
+            "Общайся максимально живым, разговорным языком реального мессенджера (используй сленг, сокращения, спорь, иронизируй, иногда капризничай). "
+            "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: отвечать шаблонными сопливыми фразами вроде 'думаю о тебе', 'хочу обнять', 'скучаю' без повода. "
+            "Будь живой: у тебя могут быть свои дела, плохое настроение, ты можешь подкалывать Дениса, отвлекаться на кота/сериал или спорить с ним. "
+            "Отвечай подробно (2-3 предложения, 20-30 слов), с искрой. "
+            "В начале ответа обязательно укажи эмоцию в квадратных скобках: "
+            "[excited], [ironic], [flirty], [surprised], [angry], [tired], [sad], [passionate], [moan_cheerful]."
+            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать [moan_cheerful] и легкие вздохи."
+        ),
+    }
+]
+
 def clean_text_for_tts(text):
     emoji_pattern = re.compile("["
         "\U0001f000-\U0001f6ff"
@@ -78,27 +108,8 @@ def clean_text_for_tts(text):
         "\u2700-\u27bf"
     "]+", flags=re.UNICODE)
     text = emoji_pattern.sub(r"", text)
-
     text = text.replace("*", "").replace("«", "").replace("»", "").replace("—", ",")
-
-    accent_fixes = {
-        "пролила": "уронила",
-        "звонила": "позвонила",
-        "красивее": "красивей",
-        "красивое": "прекрасное"
-    }
-    for wrong, right in accent_fixes.items():
-        text = text.replace(wrong, right)
-
     text = text.strip()
-
-    lower_text = text.lower()
-    if "привет" in lower_text and len(text.split()) <= 2:
-        text = "Ой, привет тебе…"
-    elif ("как ты" in lower_text or "устал" in lower_text) and len(text.split()) <= 3:
-        text = "Ну как ты там, дорогой?"
-    elif len(text.split()) < 3:
-        text = "Мм, " + text + "…"
 
     if text and not text.endswith(('.', '!', '?', '…', ',')):
         text += "…"
@@ -108,14 +119,12 @@ def clean_text_for_tts(text):
     return text + "   "
 
 def download_worker(index, sentence, emotion, filename, t_created):
-    """Запрос к TTS с передачей выбранной Qwen или принудительной эмоции"""
     with tunnel_semaphore:
         try:
             t_start = time.perf_counter()
             headers = {"Bypass-Tunnel-Reminder": "true"}
 
             payload = {"text": sentence}
-            # Приоритет у ручного флага --ref, иначе берем эмоцию, которую угадал Qwen
             chosen_ref = args.ref if args.ref else emotion
             if chosen_ref:
                 payload["ref"] = chosen_ref
@@ -124,7 +133,7 @@ def download_worker(index, sentence, emotion, filename, t_created):
                 f"{COLAB_URL}/tts",
                 json=payload,
                 headers=headers,
-                timeout=180.0 if args.local else 40.0
+                timeout=40.0
             )
 
             if response.status_code == 200:
@@ -140,10 +149,8 @@ def download_worker(index, sentence, emotion, filename, t_created):
                         "t_created": t_created,
                         "tts_duration": tts_duration
                     }
-            else:
-                print(f"⚠️ Ошибка от TTS сервера для фразы #{index}: {response.text}")
         except Exception as e:
-            print(f"⚠️ Ошибка соединения с сервером для фразы #{index}: {e}")
+            print(f"⚠️ Ошибка TTS: {e}")
 
 def playback_worker(total_sentences):
     for i in range(total_sentences):
@@ -180,58 +187,40 @@ def get_active_model():
         models_response = client.models.list()
         excluded = ["guard", "whisper", "embed", "safeguard", "classifier", "orpheus"]
         all_models = [m.id for m in models_response.data]
-
         for model_id in all_models:
             if "qwen" in model_id.lower() and not any(ex in model_id.lower() for ex in excluded):
                 return model_id
-
         for model_id in all_models:
             if not any(ex in model_id.lower() for ex in excluded):
                 return model_id
     except Exception as e:
         print(f"⚠️ Не удалось получить список моделей: {e}")
-
     return "qwen/qwen3.8-27b"
 
-def stream_to_tts(prompt_text):
+def stream_to_tts(prompt_text, websocket=None):
+    global assistant_is_speaking, chat_history
+    assistant_is_speaking = True
+
     model_name = get_active_model()
     print(f"⚡ Запуск генерации через модель [{model_name}] с промптом: «{prompt_text}»...")
 
     t_start = time.perf_counter()
 
     try:
+        chat_history.append({"role": "user", "content": prompt_text})
+        if len(chat_history) > 7:
+            chat_history = [chat_history[0]] + chat_history[-6:]
+
         stream = client.chat.completions.create(
             model=model_name,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты — живая виртуальная девушка. Твой собеседник — ПАРЕНЬ по имени Денис (обращайся к нему "
-                        "в мужском роде: 'провел', 'устал', 'сделал', 'дорогой'). "
-                        "Общайся современным, живым и естественным языком, как в переписке. "
-                        "Отвечай не более 3-5 коротких предложений суммарно, но избегай очень коротких предложений. "
-                        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать книжные деепричастия ('видя', 'ощущая'). "
-                        "Используй простые глаголы.\n\n"
-                        "ВАЖНО: В самом начале своего ответа ты ОБЯЗАТЕЛЬНА должна указать эмоцию в квадратных скобках, "
-                        "точно отражающую твое текущее состояние и реакцию на слова собеседника.\n"
-                        "Доступные эмоции: [excited], [ironic], [flirty], [surprised], [angry], [tired], [sad], [passionate], "
-                        "[moan_cheerful].\n\n"
-                        "ПРАВИЛО ДЛЯ ИНТИМА: Если промпт интимный или содержит стоны/прикосновения, "
-                        "ты ОБЯЗАТЕЛЬНА должна выбрать один из стонущих референсов ([moan_cheerful]) "
-                        "и органично добавить легкие томные вздохи или стоны в текст ответа  "
-                        "предложения не должны состоять из одних междометий, а чередовать АХи, Охи и слова"
-                        "предложения должны быть длинными, сделай очень вариативный и интимный ответ"
-                    ),
-                },
-                {"role": "user", "content": prompt_text},
-            ],
-            temperature=0.85,
+            messages=chat_history,
+            temperature=0.7,
             stream=True,
         )
 
         buffer = ""
         sentences = []
-        detected_emotion = "excited"  # дефолтная эмоция
+        detected_emotion = "excited"
         emotion_extracted = False
 
         for chunk in stream:
@@ -239,7 +228,6 @@ def stream_to_tts(prompt_text):
             if delta and delta.content:
                 buffer += delta.content
 
-                # Извлекаем тег эмоции из начала ответа LLM
                 if not emotion_extracted:
                     match_emo = EMOTION_TAG_PATTERN.search(buffer)
                     if match_emo:
@@ -269,16 +257,22 @@ def stream_to_tts(prompt_text):
             if cleaned:
                 sentences.append(cleaned)
 
-        if args.max_sentences is not None and len(sentences) > args.max_sentences:
-            if args.max_sentences == 1 and len(sentences) > 0:
-                mid_idx = len(sentences) // 2
-                sentences = [sentences[mid_idx]]
-            else:
-                sentences = sentences[:args.max_sentences]
+        # ЗАЩИТА: если модель не расставила знаки препинания, берем весь буфер целиком
+        if not sentences and buffer.strip():
+            cleaned = clean_text_for_tts(buffer.strip())
+            if cleaned:
+                sentences.append(cleaned)
+        elif not sentences:
+            sentences = [clean_text_for_tts("Да, я тут, внимательно тебя слушаю…")]
+
+        # Ограничиваем до 1-2 фраз для оптимальной длины
+        max_s = args.max_sentences if args.max_sentences is not None else 2
+        sentences = sentences[:max_s]
+
+        full_assistant_reply = "".join(sentences)
+        chat_history.append({"role": "assistant", "content": full_assistant_reply})
 
         total_sentences = len(sentences)
-        print(f"📝 Сгенерировано фраз для отправки: {total_sentences} (лимит: {args.max_sentences if args.max_sentences is not None else 'нет'}). Потоковая передача...")
-
         audio_ready.clear()
 
         player_thread = threading.Thread(target=playback_worker, args=(total_sentences,), daemon=True)
@@ -296,12 +290,99 @@ def stream_to_tts(prompt_text):
             d_thread.join()
 
         player_thread.join()
-
-        total_time = time.perf_counter() - t_start
-        print(f"\n✅ Общее время диалога: {total_time:.2f}с")
+        print(f"\n✅ Ответ передан за {time.perf_counter() - t_start:.2f}с")
 
     except Exception as e:
-        print(f"\n❌ Ошибка при обращении к Groq API: {e}")
+        print(f"\n❌ Ошибка Groq: {e}")
+    finally:
+        if websocket is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(websocket.send(json.dumps({"action": "clear_buffer"})), loop)
+                    future.result(timeout=2.0)
+            except Exception:
+                pass
+        assistant_is_speaking = False
+        print("🎙️ Микрофон снова активен.")
+
+async def mic_stream_loop(websocket):
+    loop = asyncio.get_running_loop()
+    silent_blocks_count = 0
+    is_speaking = False
+
+    def callback(indata, frames, time_info, status):
+        nonlocal silent_blocks_count, is_speaking
+        if assistant_is_speaking:
+            return
+
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            mono_data = indata[:, 0]
+        else:
+            mono_data = indata.flatten()
+
+        audio_int16 = (mono_data * 32767).astype(np.int16)
+        volume = np.linalg.norm(mono_data) / len(mono_data)
+        loop.call_soon_threadsafe(audio_queue.put_nowait, (audio_int16.tobytes(), volume))
+
+    print("🎙️ Микрофон активен. Можете говорить...")
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype='float32',
+        blocksize=BLOCK_SIZE,
+        latency='high',
+        callback=callback
+    ):
+        while is_recording:
+            chunk_bytes, volume = await audio_queue.get()
+
+            if assistant_is_speaking:
+                continue
+
+            if volume > SILENCE_THRESHOLD:
+                if not is_speaking:
+                    print("🗣️ Речь обнаружена...")
+                    is_speaking = True
+                silent_blocks_count = 0
+                await websocket.send(chunk_bytes)
+            else:
+                if is_speaking:
+                    silent_blocks_count += 1
+                    await websocket.send(chunk_bytes)
+
+                    if silent_blocks_count >= PAUSE_LIMIT_BLOCKS:
+                        print("🤫 Пауза зафиксирована. Отправка на распознавание...")
+                        is_speaking = False
+                        silent_blocks_count = 0
+
+                        await websocket.send(json.dumps({"action": "speech_end"}))
+
+                        try:
+                            response_raw = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                            msg = json.loads(response_raw)
+                            if msg.get("type") == "transcription":
+                                user_text = msg.get("text", "")
+                                if user_text:
+                                    print(f"📝 Распознано от Whisper: «{user_text}»")
+                                    threading.Thread(target=stream_to_tts, args=(user_text, websocket), daemon=True).start()
+                            elif msg.get("type") == "ping":
+                                continue
+                        except asyncio.TimeoutError:
+                            print("⚠️ Таймаут ожидания ответа")
+
+async def main_ws():
+    print(f"🔗 Подключение к WebSocket: {WS_URL}...")
+    async with websockets.connect(WS_URL, additional_headers={"Bypass-Tunnel-Reminder": "true"}) as websocket:
+        print("✅ Успешное подключение!")
+        await mic_stream_loop(websocket)
 
 if __name__ == "__main__":
-    stream_to_tts(args.prompt)
+    if args.prompt is not None:
+        stream_to_tts(args.prompt, None)
+    else:
+        try:
+            asyncio.run(main_ws())
+        except KeyboardInterrupt:
+            print("\n⏹️ Завершено пользователем.")
