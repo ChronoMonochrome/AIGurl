@@ -1,251 +1,244 @@
-import asyncio
 import os
 import re
 import subprocess
 import threading
 import time
 from dotenv import load_dotenv
-import edge_tts
 import httpx
 from groq import Groq
 
-# 1. Загружаем переменные окружения
 load_dotenv()
 api_key = os.environ.get("GROQ_API_KEY")
 
 if not api_key:
-  raise ValueError(
-      "❌ Ошибка: Не найден GROQ_API_KEY. Проверьте файл .env."
-  )
+    raise ValueError("❌ Ошибка: Не найден GROQ_API_KEY. Проверьте файл .env.")
 
-# Настраиваем прокси для edge-tts и groq
+# Настраиваем прокси для локальной сети
 os.environ["http_proxy"] = "socks5://localhost:2080"
 os.environ["https_proxy"] = "socks5://localhost:2080"
 
 http_client = httpx.Client(
     proxy="socks5://localhost:2080",
-    timeout=15.0,
+    timeout=45.0,
 )
 client = Groq(api_key=api_key, http_client=http_client)
 
 PUNCTUATION_PATTERN = re.compile(r"([.!?\n]+)")
 
-# Словарь для хранения готовых файлов по индексам и мьютекс для потокобезопасности
 audio_ready = {}
 audio_lock = threading.Lock()
 
+# Семафор ограничивает количество одновременных запросов в Colab (максимум 2)
+tunnel_semaphore = threading.Semaphore(2)
+
+# ПОСТОЯННЫЙ СТАТИЧЕСКИЙ АДРЕС COLAB
+COLAB_URL = ""
 
 def clean_text_for_tts(text):
-  emoji_pattern = re.compile(
-      "["
-      "\U0001f000-\U0001f6ff"
-      "\U0001f900-\U0001f9ff"
-      "\U0001f1e0-\U0001f6ff"
-      "\u2600-\u26ff"
-      "\u2700-\u27bf"
-      "]+",
-      flags=re.UNICODE,
-  )
-  text = emoji_pattern.sub(r"", text)
-  text = text.replace("«", "").replace("»", "").replace("—", ",")
-  return text.strip()
+    emoji_pattern = re.compile("["
+        "\U0001f000-\U0001f6ff"
+        "\U0001f900-\U0001f9ff"
+        "\U0001f1e0-\U0001f6ff"
+        "\u2600-\u26ff"
+        "\u2700-\u27bf"
+    "]+", flags=re.UNICODE)
+    text = emoji_pattern.sub(r"", text)
 
+    # Убираем звездочки markdown и лишние символы
+    text = text.replace("*", "").replace("«", "").replace("»", "").replace("—", ",")
 
-def get_tts_parameters(sentence):
-  """Динамически настраивает скорость и тон голоса в зависимости от знаков в тексте."""
-  rate = "+0%"
-  pitch = "+0Hz"
+    # Автозамена слов с проблемными ударениями
+    accent_fixes = {
+        "пролила": "уронила",
+        "звонила": "позвонила",
+        "красивее": "красивей",
+        "красивое": "прекрасное"
+    }
+    for wrong, right in accent_fixes.items():
+        text = text.replace(wrong, right)
 
-  if "!" in sentence:
-    pitch = "+3Hz"  # Чувыше тональность для эмоций
-    rate = "+5%"  # Чуть быстрее для энергии
-  elif "?" in sentence:
-    pitch = "+2Hz"  # Интонация вопроса
-    rate = "+0%"
-  elif len(sentence) < 15:
-    pitch = "+1Hz"  # Короткие реплики звучат живее
+    text = text.strip()
 
-  return rate, pitch
+    # Защита коротких фраз
+    lower_text = text.lower()
+    if "привет" in lower_text and len(text.split()) <= 2:
+        text = "Ой, привет тебе…"
+    elif ("как ты" in lower_text or "устал" in lower_text) and len(text.split()) <= 3:
+        text = "Ну как ты там, дорогой?"
+    elif len(text.split()) < 3:
+        text = "Мм, " + text + "…"
 
+    if text and not text.endswith(('.', '!', '?', '…', ',')):
+        text += "…"
+    elif text.endswith('.'):
+        text = text[:-1] + "…"
 
-async def generate_audio_file(text, filename, rate, pitch):
-  communicate = edge_tts.Communicate(
-      text, "ru-RU-SvetlanaNeural", rate=rate, pitch=pitch
-  )
-  await communicate.save(filename)
+    # ХАК: Добавляем слово "ня" в конце каждой фразы,
+    # чтобы F5-TTS сбрасывал всю «театральность» обрыва на него (Colab его отрежет)
+    text = text + ", ня!"
 
+    return text
 
 def download_worker(index, sentence, filename, t_created):
-  """Параллельное скачивание конкретного предложения с динамической озвучкой"""
-  try:
-    t_start = time.perf_counter()
-    rate, pitch = get_tts_parameters(sentence)
-    asyncio.run(generate_audio_file(sentence, filename, rate, pitch))
-    tts_duration = time.perf_counter() - t_start
+    """Запрос к F5-TTS с защитой от перегрузки туннеля через семафор"""
+    with tunnel_semaphore:
+        try:
+            t_start = time.perf_counter()
+            headers = {"Bypass-Tunnel-Reminder": "true"}
 
-    with audio_lock:
-      audio_ready[index] = {
-          "filename": filename,
-          "sentence": sentence,
-          "t_created": t_created,
-          "tts_duration": tts_duration,
-      }
-  except Exception as e:
-    print(f"⚠️ Ошибка скачивания TTS для фразы #{index}: {e}")
+            response = http_client.post(
+                f"{COLAB_URL}/tts",
+                json={"text": sentence},
+                headers=headers,
+                timeout=40.0
+            )
 
+            if response.status_code == 200:
+                with open(filename, "wb") as f:
+                    f.write(response.content)
+                tts_duration = time.perf_counter() - t_start
+
+                with audio_lock:
+                    audio_ready[index] = {
+                        "filename": filename,
+                        "sentence": sentence,
+                        "t_created": t_created,
+                        "tts_duration": tts_duration
+                    }
+            else:
+                print(f"⚠️ Ошибка от Colab TTS для фразы #{index}: {response.text}")
+        except Exception as e:
+            print(f"⚠️ Ошибка соединения с Colab для фразы #{index}: {e}")
 
 def playback_worker(total_sentences):
-  """Воспроизведение строго по порядку (index 0, 1, 2...)"""
-  for i in range(total_sentences):
-    while True:
-      with audio_lock:
-        if i in audio_ready:
-          data = audio_ready.pop(i)
-          break
-      time.sleep(0.05)
+    """Потоковое воспроизведение фраз по мере их готовности"""
+    for i in range(total_sentences):
+        while True:
+            with audio_lock:
+                if i in audio_ready:
+                    data = audio_ready.pop(i)
+                    break
+            time.sleep(0.03)
 
-    filename = data["filename"]
-    sentence = data["sentence"]
-    t_created = data["t_created"]
-    tts_duration = data["tts_duration"]
+        filename = data["filename"]
+        sentence = data["sentence"]
+        t_created = data["t_created"]
+        tts_duration = data["tts_duration"]
 
-    queue_wait_duration = time.perf_counter() - t_created
+        queue_wait_duration = time.perf_counter() - t_created
 
-    t_play_start = time.perf_counter()
-    subprocess.run(
-        ["mpv", "--no-video", "--really-quiet", filename],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    play_duration = time.perf_counter() - t_play_start
+        t_play_start = time.perf_counter()
+        subprocess.run(
+            ["mpv", "--no-video", "--really-quiet", filename],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        play_duration = time.perf_counter() - t_play_start
 
-    print(
-        f"⏱️ [Метрика] Ожидание порядка: {queue_wait_duration:.2f}с |"
-        f" Edge-TTS запрос: {tts_duration:.2f}с | Воспроизведение:"
-        f" {play_duration:.2f}с | Текст: '{sentence}'"
-    )
+        print(f"⏱️ [Метрика] Ожидание: {queue_wait_duration:.2f}с | F5-TTS генерация: {tts_duration:.2f}с | Воспроизведение: {play_duration:.2f}с | Текст: '{sentence}'")
 
-    if os.path.exists(filename):
-      os.remove(filename)
-
+        if os.path.exists(filename):
+            os.remove(filename)
 
 def get_active_model():
-  try:
-    models_response = client.models.list()
-    excluded = [
-        "guard",
-        "whisper",
-        "embed",
-        "safeguard",
-        "classifier",
-        "orpheus",
-    ]
-    all_models = [m.id for m in models_response.data]
+    try:
+        models_response = client.models.list()
+        excluded = ["guard", "whisper", "embed", "safeguard", "classifier", "orpheus"]
+        all_models = [m.id for m in models_response.data]
 
-    for model_id in all_models:
-      if "qwen" in model_id.lower() and not any(
-          ex in model_id.lower() for ex in excluded
-      ):
-        return model_id
+        for model_id in all_models:
+            if "qwen" in model_id.lower() and not any(ex in model_id.lower() for ex in excluded):
+                return model_id
 
-    for model_id in all_models:
-      if not any(ex in model_id.lower() for ex in excluded):
-        return model_id
-  except Exception as e:
-    print(f"⚠️ Не удалось получить список моделей: {e}")
+        for model_id in all_models:
+            if not any(ex in model_id.lower() for ex in excluded):
+                return model_id
+    except Exception as e:
+        print(f"⚠️ Не удалось получить список моделей: {e}")
 
-  return "qwen/qwen3.8-27b"
-
+    return "qwen/qwen3.8-27b"
 
 def stream_to_tts(prompt_text):
-  model_name = get_active_model()
-  print(f"⚡ Запуск генерации через модель [{model_name}]...")
+    model_name = get_active_model()
+    print(f"⚡ Запуск генерации через модель [{model_name}]...")
 
-  t_start = time.perf_counter()
+    t_start = time.perf_counter()
 
-  try:
-    stream = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты — милая и живая виртуальная девушка. Отвечай"
-                    " разговорным русским языком. Используй короткие и длинные"
-                    " предложения вперемешку, а также живые эмоции и междометия"
-                    " (ой!, хм..., вау, ух ты). Активно используй"
-                    " вопросительные (?) и восклицательные (!) знаки, так как от"
-                    " них зависит интонация речи."
-                ),
-            },
-            {"role": "user", "content": prompt_text},
-        ],
-        temperature=0.8,  # Чуть выше креативность для более разнообразных ответов
-        stream=True,
-    )
+    try:
+        stream = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — живая виртуальная девушка. Твой собеседник — ПАРЕНЬ по имени Денис (обращайся к нему "
+                        "в мужском роде: 'провел', 'устал', 'сделал', 'дорогой'). "
+                        "Общайся современным, живым и естественным языком, как в переписке. "
+                        "Отвечай лаконично (не более 3-5 коротких предложений суммарно). "
+                        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать книжные деепричастия ('видя', 'ощущая'). "
+                        "Используй простые глаголы. Органично вплетай легкие разговорные междометия (хи-хи, ой, ммм)."
+                    ),
+                },
+                {"role": "user", "content": prompt_text},
+            ],
+            temperature=0.65,
+            stream=True,
+        )
 
-    buffer = ""
-    sentences = []
+        buffer = ""
+        sentences = []
 
-    for chunk in stream:
-      delta = chunk.choices[0].delta
-      if delta and delta.content:
-        buffer += delta.content
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                buffer += delta.content
 
-        while True:
-          match = PUNCTUATION_PATTERN.search(buffer)
-          if not match:
-            break
+                while True:
+                    match = PUNCTUATION_PATTERN.search(buffer)
+                    if not match:
+                        break
 
-          split_idx = match.end()
-          sentence = buffer[:split_idx].strip()
-          buffer = buffer[split_idx:]
+                    split_idx = match.end()
+                    sentence = buffer[:split_idx].strip()
+                    buffer = buffer[split_idx:]
 
-          if sentence:
-            cleaned = clean_text_for_tts(sentence)
+                    if sentence:
+                        cleaned = clean_text_for_tts(sentence)
+                        if cleaned:
+                            sentences.append(cleaned)
+
+        if buffer.strip():
+            cleaned = clean_text_for_tts(buffer.strip())
             if cleaned:
-              sentences.append(cleaned)
+                sentences.append(cleaned)
 
-    if buffer.strip():
-      cleaned = clean_text_for_tts(buffer.strip())
-      if cleaned:
-        sentences.append(cleaned)
+        total_sentences = len(sentences)
+        print(f"📝 Сгенерировано фраз: {total_sentences}. Потоковая передача...")
 
-    total_sentences = len(sentences)
-    print(
-        f"📝 Сгенерировано предложений: {total_sentences}. Параллельная"
-        " загрузка..."
-    )
+        audio_ready.clear()
 
-    audio_ready.clear()
+        player_thread = threading.Thread(target=playback_worker, args=(total_sentences,), daemon=True)
+        player_thread.start()
 
-    player_thread = threading.Thread(
-        target=playback_worker, args=(total_sentences,), daemon=True
-    )
-    player_thread.start()
+        download_threads = []
+        for i, sentence in enumerate(sentences):
+            filename = f"audio_part_{i}.wav"
+            t_created = time.perf_counter()
+            d_thread = threading.Thread(target=download_worker, args=(i, sentence, filename, t_created))
+            d_thread.start()
+            download_threads.append(d_thread)
 
-    download_threads = []
-    for i, sentence in enumerate(sentences):
-      filename = f"audio_part_{i}.mp3"
-      t_created = time.perf_counter()
-      d_thread = threading.Thread(
-          target=download_worker, args=(i, sentence, filename, t_created)
-      )
-      d_thread.start()
-      download_threads.append(d_thread)
+        for d_thread in download_threads:
+            d_thread.join()
 
-    for d_thread in download_threads:
-      d_thread.join()
+        player_thread.join()
 
-    player_thread.join()
+        total_time = time.perf_counter() - t_start
+        print(f"\n✅ Общее время диалога: {total_time:.2f}с")
 
-    total_time = time.perf_counter() - t_start
-    print(f"\n✅ Общее время выполнения диалога: {total_time:.2f}с")
-
-  except Exception as e:
-    print(f"\n❌ Ошибка при обращении к Groq API: {e}")
-
+    except Exception as e:
+        print(f"\n❌ Ошибка при обращении к Groq API: {e}")
 
 if __name__ == "__main__":
-  test_prompt = "Привет! Расскажи короткую историю о том, как ты провела день."
-  stream_to_tts(test_prompt)
+    test_prompt = "Привет! Расскажи короткую историю о том, как ты провела день."
+    stream_to_tts(test_prompt)
