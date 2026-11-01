@@ -23,7 +23,7 @@ parser.add_argument(
 parser.add_argument(
     "--max-sentences",
     type=int,
-    default=1,  # <--- По умолчанию 1 фраза для мгновенного ответа без задержек!
+    default=1,
     help="Максимальное количество фраз для генерации"
 )
 parser.add_argument(
@@ -57,7 +57,6 @@ if args.local:
     print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
     http_client = httpx.Client(timeout=1800.0)
 else:
-    # Читаем статический адрес из .env
     COLAB_URL = os.environ.get("COLAB_URL")
     if not COLAB_URL:
         raise ValueError("❌ Ошибка: Не найден COLAB_URL в файле .env. Укажите статический адрес ngrok.")
@@ -82,13 +81,12 @@ SAMPLE_RATE = 16000
 BLOCK_DURATION = 0.5
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_DURATION)
 SILENCE_THRESHOLD = 0.0008
-PAUSE_LIMIT_BLOCKS = 3  # Уменьшили до 3 блоков (1.5 сек паузы) для быстрой реакции
+PAUSE_LIMIT_BLOCKS = 3
 is_recording = True
 audio_queue = asyncio.Queue()
 
 assistant_is_speaking = False
 
-# История диалога для сохранения контекста беседы
 chat_history = [
     {
         "role": "system",
@@ -97,10 +95,10 @@ chat_history = [
             "Общайся максимально живым, разговорным языком реального мессенджера (используй сленг, сокращения, спорь, иронизируй, иногда капризничай). "
             "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: отвечать шаблонными сопливыми фразами вроде 'думаю о тебе', 'хочу обнять', 'скучаю' без повода. "
             "Будь живой: у тебя могут быть свои дела, плохое настроение, ты можешь подкалывать Дениса, отвлекаться на кота/сериал или спорить с ним. "
-            "Отвечай  с искрой. "
+            "Отвечай с искрой. "
             "В начале ответа обязательно укажи эмоцию в квадратных скобках: "
             "[excited] [flirty], [surprised], [ironic], [angry], [tired], [sad], [passionate], [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
-            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited],  и легкие вздохи"
+            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited], и легкие вздохи"
             "ЗАПРЕЩЕНО: СЛИШКОМ КОРОТКИЕ ПРЕДЛОЖЕНИЯ"
         ),
     }
@@ -123,7 +121,7 @@ def clean_text_for_tts(text):
     elif text.endswith('.'):
         text = text[:-1] + "…"
 
-    return text + "   "
+    return text + "    "
 
 def download_worker(index, sentence, emotion, filename, t_created):
     with tunnel_semaphore:
@@ -264,7 +262,6 @@ def stream_to_tts(prompt_text, websocket=None):
             if cleaned:
                 sentences.append(cleaned)
 
-        # ЗАЩИТА: если модель не расставила знаки препинания, берем весь буфер целиком
         if not sentences and buffer.strip():
             cleaned = clean_text_for_tts(buffer.strip())
             if cleaned:
@@ -272,7 +269,6 @@ def stream_to_tts(prompt_text, websocket=None):
         elif not sentences:
             sentences = [clean_text_for_tts("Да, я тут, внимательно тебя слушаю…")]
 
-        # Ограничиваем до 1-2 фраз для оптимальной длины
         max_s = args.max_sentences if args.max_sentences is not None else 2
         sentences = sentences[:max_s]
 
@@ -381,7 +377,13 @@ async def mic_stream_loop(websocket):
 
 async def main_ws():
     print(f"🔗 Подключение к WebSocket: {WS_URL}...")
-    async with websockets.connect(WS_URL, additional_headers={"Bypass-Tunnel-Reminder": "true"}) as websocket:
+    # Добавлены параметры ping_interval и ping_timeout для предотвращения таймаута туннеля
+    async with websockets.connect(
+        WS_URL,
+        additional_headers={"Bypass-Tunnel-Reminder": "true"},
+        ping_interval=20,
+        ping_timeout=20
+    ) as websocket:
         print("✅ Успешное подключение!")
         await mic_stream_loop(websocket)
 
