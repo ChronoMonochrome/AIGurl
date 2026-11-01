@@ -55,7 +55,7 @@ if args.local:
     COLAB_URL = "http://localhost:8000"
     WS_URL = "ws://localhost:8000/ws/voice"
     print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
-    http_client = httpx.Client(timeout=180.0)
+    http_client = httpx.Client(timeout=1800.0)
 else:
     # Читаем статический адрес из .env
     COLAB_URL = os.environ.get("COLAB_URL")
@@ -97,10 +97,11 @@ chat_history = [
             "Общайся максимально живым, разговорным языком реального мессенджера (используй сленг, сокращения, спорь, иронизируй, иногда капризничай). "
             "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: отвечать шаблонными сопливыми фразами вроде 'думаю о тебе', 'хочу обнять', 'скучаю' без повода. "
             "Будь живой: у тебя могут быть свои дела, плохое настроение, ты можешь подкалывать Дениса, отвлекаться на кота/сериал или спорить с ним. "
-            "Отвечай подробно (2-3 предложения, 20-30 слов), с искрой. "
+            "Отвечай  с искрой. "
             "В начале ответа обязательно укажи эмоцию в квадратных скобках: "
-            "[excited], [ironic], [flirty], [surprised], [angry], [tired], [sad], [passionate], [moan_cheerful]."
-            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать [moan_cheerful] и легкие вздохи."
+            "[excited] [flirty], [surprised], [ironic], [angry], [tired], [sad], [passionate], [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
+            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited],  и легкие вздохи"
+            "ЗАПРЕЩЕНО: СЛИШКОМ КОРОТКИЕ ПРЕДЛОЖЕНИЯ"
         ),
     }
 ]
@@ -139,7 +140,7 @@ def download_worker(index, sentence, emotion, filename, t_created):
                 f"{COLAB_URL}/tts",
                 json=payload,
                 headers=headers,
-                timeout=40.0
+                timeout=4000.0
             )
 
             if response.status_code == 200:
