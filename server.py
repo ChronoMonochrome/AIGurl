@@ -76,7 +76,7 @@ for char_name, refs in CHARACTERS_CONFIG.items():
         mp3_path = os.path.join(char_dir, data["filename"])
         wav_filename = data["filename"].rsplit(".", 1)[0] + "_16k.wav"
         wav_path = os.path.join(char_dir, wav_filename)
-        
+
         if not os.path.exists(mp3_path):
             file_url = f"{GITHUB_RAW_BASE}/{char_name}/{data['filename']}"
             try:
@@ -84,7 +84,7 @@ for char_name, refs in CHARACTERS_CONFIG.items():
                 urllib.request.urlretrieve(file_url, mp3_path)
             except Exception as e:
                 print(f"⚠️ Ошибка скачивания {file_url}: {e}")
-        
+
         if os.path.exists(mp3_path) and not os.path.exists(wav_path):
             try:
                 speech, sr = torchaudio.load(mp3_path)
@@ -112,35 +112,34 @@ print("✅ Инициализация референсов завершена.")
 async def tts_endpoint(data: dict):
     raw_text = data.get("text", "")
     requested_char = data.get("character", "sofia")
-    
     requested_ref = data.get("ref") or data.get("emotion") or data.get("style") or "excited"
-    
+
     if not raw_text:
         return {"error": "No text provided"}
 
     char_refs = LOADED_CHARACTERS.get(requested_char, LOADED_CHARACTERS["sofia"])
-    
     ref_data = char_refs.get(requested_ref)
     if not ref_data:
-        print(f"⚠️ Эмоция '{requested_ref}' не найдена для персонажа '{requested_char}', используем 'excited'.")
         ref_data = char_refs.get("excited", {})
-    
-    prompt_wav = ref_data.get("prompt_speech_16k")
-    
-    if not prompt_wav or not os.path.exists(prompt_wav):
-        return {"error": f"Reference voice file for {requested_char}/{requested_ref} not found on disk: {prompt_wav}"}, 400
 
-    print(f"🎯 [TTS Запрос] Персонаж: {requested_char} | Эмоция: {requested_ref} | Файл референса: {prompt_wav}")
-    print(f"💬 Текст для синтеза: {raw_text}")
+    prompt_wav = ref_data.get("prompt_speech_16k")
+    if not prompt_wav or not os.path.exists(prompt_wav):
+        return {"error": f"Reference voice file not found on disk: {prompt_wav}"}, 400
+
+    print(f"🎯 [TTS Запрос] Персонаж: {requested_char} | Эмоция: {requested_ref} | Текст: {raw_text}")
 
     try:
         audio_chunks = []
-        prompt_text_with_instruct = f"You are a helpful assistant.<|endofprompt|>{ref_data['prompt_text']}"
+        # Если синтезируемый текст слишком короткий относительно промпта, не передаем prompt_text, чтобы избежать багов CosyVoice 3
+        if len(raw_text.split()) < 4:
+            prompt_text_with_instruct = "You are a helpful assistant.<|endofprompt|>"
+        else:
+            prompt_text_with_instruct = f"You are a helpful assistant.<|endofprompt|>{ref_data.get('prompt_text', '')}"
 
         for i, j in enumerate(cosyvoice.inference_zero_shot(
-            raw_text, 
-            prompt_text_with_instruct, 
-            prompt_wav, 
+            raw_text,
+            prompt_text_with_instruct,
+            prompt_wav,
             stream=False
         )):
             speech_np = j['tts_speech'].detach().cpu().numpy()
@@ -191,41 +190,41 @@ async def voice_websocket(websocket: WebSocket):
 
             if "bytes" in message:
                 audio_buffer.extend(message["bytes"])
-                
+
             elif "text" in message:
                 data = json.loads(message["text"])
                 action = data.get("action")
-                
+
                 if action == "speech_end":
                     if len(audio_buffer) > 0:
                         temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                         temp_name = temp_audio.name
                         temp_audio.close()
-                        
+
                         audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                         sf.write(temp_name, audio_np, 16000)
                         audio_buffer.clear()
-                        
+
                         dynamic_prompt = "Разговор Дениса и девушки. " + " ".join(transcription_history[-6:])
-                        
+
                         print("🎙️ Распознавание речи через Whisper...")
                         result = whisper_model.transcribe(
-                            temp_name, 
+                            temp_name,
                             language="ru",
                             initial_prompt=dynamic_prompt,
                             condition_on_previous_text=False,
                             beam_size=5
                         )
                         user_text = result.get("text", "").strip()
-                        
+
                         if os.path.exists(temp_name):
                             os.remove(temp_name)
-                            
+
                         print(f"📝 Распознанный текст: '{user_text}'")
-                        
+
                         if user_text:
                             transcription_history.append(f"Денис: {user_text}")
-                        
+
                         await websocket.send_json({
                             "type": "transcription",
                             "text": user_text
@@ -237,7 +236,7 @@ async def voice_websocket(websocket: WebSocket):
                 elif action in ("clear_buffer", "interrupt"):
                     audio_buffer.clear()
                     print("⚡ Буфер аудио на сервере очищен.")
-                    
+
     except WebSocketDisconnect:
         print("🔌 Клиент отключился от WebSocket")
     except Exception as e:

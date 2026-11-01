@@ -13,31 +13,11 @@ from dotenv import load_dotenv
 import httpx
 from groq import Groq
 
-# Парсим аргументы командной строки
 parser = argparse.ArgumentParser(description="Клиент для голосового ассистента Virtual Girlfriend")
-parser.add_argument(
-    "--local",
-    action="store_true",
-    help="Использовать локальный сервер TTS (http://localhost:8000) вместо Google Colab"
-)
-parser.add_argument(
-    "--max-sentences",
-    type=int,
-    default=1,
-    help="Максимальное количество фраз для генерации"
-)
-parser.add_argument(
-    "--prompt",
-    type=str,
-    default=None,
-    help="Текст сообщения (если не задан, включается дуплексный режим с микрофоном)"
-)
-parser.add_argument(
-    "--ref",
-    type=str,
-    default=None,
-    help="Принудительная эмоция/референс"
-)
+parser.add_argument("--local", action="store_true", help="Использовать локальный сервер TTS")
+parser.add_argument("--max-sentences", type=int, default=1, help="Максимальное количество фраз")
+parser.add_argument("--prompt", type=str, default=None, help="Текст сообщения")
+parser.add_argument("--ref", type=str, default=None, help="Принудительная эмоция")
 args = parser.parse_args()
 
 load_dotenv()
@@ -54,20 +34,15 @@ os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 if args.local:
     COLAB_URL = "http://localhost:8000"
     WS_URL = "ws://localhost:8000/ws/voice"
-    print(f"🛠️ Режим отладки: запуск с ЛОКАЛЬНЫМ сервером TTS (лимит фраз: {args.max_sentences})")
     http_client = httpx.Client(timeout=1800.0)
 else:
     COLAB_URL = os.environ.get("COLAB_URL")
     if not COLAB_URL:
-        raise ValueError("❌ Ошибка: Не найден COLAB_URL в файле .env. Укажите статический адрес ngrok.")
+        raise ValueError("❌ Ошибка: Не найден COLAB_URL в файле .env.")
     COLAB_URL = COLAB_URL.rstrip("/")
     WS_URL = COLAB_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/voice"
+    http_client = httpx.Client(proxy="socks5://localhost:2080", timeout=45.0)
 
-    print(f"🌐 Режим продакшена: сервер Colab ({COLAB_URL}, лимит фраз: {args.max_sentences})")
-    http_client = httpx.Client(
-        proxy="socks5://localhost:2080",
-        timeout=45.0,
-    )
 client = Groq(api_key=api_key, http_client=http_client)
 
 PUNCTUATION_PATTERN = re.compile(r"([.!?\n]+)")
@@ -84,7 +59,6 @@ SILENCE_THRESHOLD = 0.0008
 PAUSE_LIMIT_BLOCKS = 3
 is_recording = True
 audio_queue = asyncio.Queue()
-
 assistant_is_speaking = False
 
 chat_history = [
@@ -98,7 +72,7 @@ chat_history = [
             "Отвечай с искрой. "
             "В начале ответа обязательно укажи эмоцию в квадратных скобках: "
             "[excited] [flirty], [surprised], [ironic], [angry], [tired], [sad], [passionate], [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
-            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited], и легкие вздохи"
+            "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
             "ЗАПРЕЩЕНО: СЛИШКОМ КОРОТКИЕ ПРЕДЛОЖЕНИЯ"
         ),
     }
@@ -129,7 +103,10 @@ def download_worker(index, sentence, emotion, filename, t_created):
             t_start = time.perf_counter()
             headers = {"Bypass-Tunnel-Reminder": "true"}
 
-            payload = {"text": sentence}
+            payload = {
+                "text": sentence,
+                "history": chat_history[-4:]  # Передаем контекст последних сообщений
+            }
             chosen_ref = args.ref if args.ref else emotion
             if chosen_ref:
                 payload["ref"] = chosen_ref
@@ -195,11 +172,8 @@ def get_active_model():
         for model_id in all_models:
             if "qwen" in model_id.lower() and not any(ex in model_id.lower() for ex in excluded):
                 return model_id
-        for model_id in all_models:
-            if not any(ex in model_id.lower() for ex in excluded):
-                return model_id
-    except Exception as e:
-        print(f"⚠️ Не удалось получить список моделей: {e}")
+    except Exception:
+        pass
     return "qwen/qwen3.8-27b"
 
 def stream_to_tts(prompt_text, websocket=None):
@@ -262,11 +236,7 @@ def stream_to_tts(prompt_text, websocket=None):
             if cleaned:
                 sentences.append(cleaned)
 
-        if not sentences and buffer.strip():
-            cleaned = clean_text_for_tts(buffer.strip())
-            if cleaned:
-                sentences.append(cleaned)
-        elif not sentences:
+        if not sentences:
             sentences = [clean_text_for_tts("Да, я тут, внимательно тебя слушаю…")]
 
         max_s = args.max_sentences if args.max_sentences is not None else 2
@@ -319,25 +289,14 @@ async def mic_stream_loop(websocket):
         if assistant_is_speaking:
             return
 
-        if indata.ndim > 1 and indata.shape[1] > 1:
-            mono_data = indata[:, 0]
-        else:
-            mono_data = indata.flatten()
-
+        mono_data = indata[:, 0] if indata.ndim > 1 and indata.shape[1] > 1 else indata.flatten()
         audio_int16 = (mono_data * 32767).astype(np.int16)
         volume = np.linalg.norm(mono_data) / len(mono_data)
         loop.call_soon_threadsafe(audio_queue.put_nowait, (audio_int16.tobytes(), volume))
 
     print("🎙️ Микрофон активен. Можете говорить...")
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype='float32',
-        blocksize=BLOCK_SIZE,
-        latency='high',
-        callback=callback
-    ):
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=BLOCK_SIZE, latency='high', callback=callback):
         while is_recording:
             chunk_bytes, volume = await audio_queue.get()
 
@@ -370,20 +329,12 @@ async def mic_stream_loop(websocket):
                                 if user_text:
                                     print(f"📝 Распознано от Whisper: «{user_text}»")
                                     threading.Thread(target=stream_to_tts, args=(user_text, websocket), daemon=True).start()
-                            elif msg.get("type") == "ping":
-                                continue
                         except asyncio.TimeoutError:
                             print("⚠️ Таймаут ожидания ответа")
 
 async def main_ws():
     print(f"🔗 Подключение к WebSocket: {WS_URL}...")
-    # Добавлены параметры ping_interval и ping_timeout для предотвращения таймаута туннеля
-    async with websockets.connect(
-        WS_URL,
-        additional_headers={"Bypass-Tunnel-Reminder": "true"},
-        ping_interval=20,
-        ping_timeout=20
-    ) as websocket:
+    async with websockets.connect(WS_URL, additional_headers={"Bypass-Tunnel-Reminder": "true"}, ping_interval=20, ping_timeout=20) as websocket:
         print("✅ Успешное подключение!")
         await mic_stream_loop(websocket)
 
