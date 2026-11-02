@@ -18,6 +18,14 @@ parser.add_argument("--local", action="store_true", help="Использоват
 parser.add_argument("--max-sentences", type=int, default=1, help="Максимальное количество фраз")
 parser.add_argument("--prompt", type=str, default=None, help="Текст сообщения")
 parser.add_argument("--ref", type=str, default=None, help="Принудительная эмоция")
+parser.add_argument(
+    "--proxy",
+    type=str,
+    nargs="?",
+    const="socks5://localhost:2080",
+    default=None,
+    help="URL прокси (например, socks5://localhost:2080)"
+)
 args = parser.parse_args()
 
 load_dotenv()
@@ -26,10 +34,17 @@ api_key = os.environ.get("GROQ_API_KEY")
 if not api_key:
     raise ValueError("❌ Ошибка: Не найден GROQ_API_KEY. Проверьте файл .env.")
 
-os.environ["http_proxy"] = "socks5://localhost:2080"
-os.environ["https_proxy"] = "socks5://localhost:2080"
-os.environ["no_proxy"] = "localhost,127.0.0.1"
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+# Прокси настраивается через аргумент --proxy или переменную PROXY в .env
+proxy_url = args.proxy if args.proxy is not None else os.environ.get("PROXY")
+
+if proxy_url:
+    os.environ["http_proxy"] = proxy_url
+    os.environ["https_proxy"] = proxy_url
+    os.environ["no_proxy"] = "localhost,127.0.0.1"
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    print(f"🌐 Использование прокси включено: {proxy_url}")
+else:
+    proxy_url = None
 
 if args.local:
     COLAB_URL = "http://localhost:8000"
@@ -41,7 +56,7 @@ else:
         raise ValueError("❌ Ошибка: Не найден COLAB_URL в файле .env.")
     COLAB_URL = COLAB_URL.rstrip("/")
     WS_URL = COLAB_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/voice"
-    http_client = httpx.Client(proxy="socks5://localhost:2080", timeout=45.0)
+    http_client = httpx.Client(proxy=proxy_url, timeout=45.0) if proxy_url else httpx.Client(timeout=45.0)
 
 client = Groq(api_key=api_key, http_client=http_client)
 
@@ -74,6 +89,7 @@ chat_history = [
             "[excited] [flirty], [surprised], [ironic], [angry], [tired], [sad], [passionate], [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
             "ПРАВИЛО ДЛЯ ИНТИМА: Если контекст интимный, ты ДОЛЖНА использовать один из вариантов [moan_fast], [moan_very_fast], [moan_cheerful], [moan_excited]."
             "ЗАПРЕЩЕНО: СЛИШКОМ КОРОТКИЕ ПРЕДЛОЖЕНИЯ"
+            "ЗАПРЕЩЕНО: ПОЭТИЧНЫЙ И ДРАМАТИЧНЫЙ ЯЗЫК"
         ),
     }
 ]
@@ -105,7 +121,7 @@ def download_worker(index, sentence, emotion, filename, t_created):
 
             payload = {
                 "text": sentence,
-                "history": chat_history[-4:]  # Передаем контекст последних сообщений
+                "history": chat_history[-4:]
             }
             chosen_ref = args.ref if args.ref else emotion
             if chosen_ref:
@@ -294,43 +310,75 @@ async def mic_stream_loop(websocket):
         volume = np.linalg.norm(mono_data) / len(mono_data)
         loop.call_soon_threadsafe(audio_queue.put_nowait, (audio_int16.tobytes(), volume))
 
-    print("🎙️ Микрофон активен. Можете говорить...")
+    print("🎙️ Микрофон активен. Можете говорить (или введите текст в консоль для переключения на текст)...")
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=BLOCK_SIZE, latency='high', callback=callback):
+    async def input_listener():
         while is_recording:
-            chunk_bytes, volume = await audio_queue.get()
+            try:
+                user_input = await asyncio.get_event_loop().run_in_executor(None, input)
+                user_input = user_input.strip()
+                if user_input:
+                    print(f"⌨️ Текстовый ввод: «{user_input}»")
+                    stream_to_tts(user_input, websocket)
+            except Exception:
+                break
 
-            if assistant_is_speaking:
-                continue
+    input_task = asyncio.create_task(input_listener())
 
-            if volume > SILENCE_THRESHOLD:
-                if not is_speaking:
-                    print("🗣️ Речь обнаружена...")
-                    is_speaking = True
-                silent_blocks_count = 0
-                await websocket.send(chunk_bytes)
-            else:
-                if is_speaking:
-                    silent_blocks_count += 1
-                    await websocket.send(chunk_bytes)
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=BLOCK_SIZE, latency='high', callback=callback):
+            while is_recording:
+                try:
+                    chunk_bytes, volume = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
 
-                    if silent_blocks_count >= PAUSE_LIMIT_BLOCKS:
-                        print("🤫 Пауза зафиксирована. Отправка на распознавание...")
-                        is_speaking = False
-                        silent_blocks_count = 0
+                if assistant_is_speaking:
+                    continue
 
-                        await websocket.send(json.dumps({"action": "speech_end"}))
-
+                if volume > SILENCE_THRESHOLD:
+                    if not is_speaking:
+                        print("🗣️ Речь обнаружена...")
+                        is_speaking = True
+                    silent_blocks_count = 0
+                    try:
+                        await websocket.send(chunk_bytes)
+                    except Exception:
+                        break
+                else:
+                    if is_speaking:
+                        silent_blocks_count += 1
                         try:
-                            response_raw = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                            msg = json.loads(response_raw)
-                            if msg.get("type") == "transcription":
-                                user_text = msg.get("text", "")
-                                if user_text:
-                                    print(f"📝 Распознано от Whisper: «{user_text}»")
-                                    threading.Thread(target=stream_to_tts, args=(user_text, websocket), daemon=True).start()
-                        except asyncio.TimeoutError:
-                            print("⚠️ Таймаут ожидания ответа")
+                            await websocket.send(chunk_bytes)
+                        except Exception:
+                            break
+
+                        if silent_blocks_count >= PAUSE_LIMIT_BLOCKS:
+                            print("🤫 Пауза зафиксирована. Отправка на распознавание...")
+                            is_speaking = False
+                            silent_blocks_count = 0
+
+                            try:
+                                await websocket.send(json.dumps({"action": "speech_end"}))
+
+                                response_raw = await asyncio.wait_for(websocket.recv(), timeout=15.0)
+                                msg = json.loads(response_raw)
+                                if msg.get("type") == "transcription":
+                                    user_text = msg.get("text", "")
+                                    if user_text:
+                                        print(f"📝 Распознано от Whisper: «{user_text}»")
+                                        threading.Thread(target=stream_to_tts, args=(user_text, websocket), daemon=True).start()
+                            except asyncio.TimeoutError:
+                                print("⚠️ Превышен тайм-аут ожидания ответа от Whisper. Сбрасываем буфер...")
+                                try:
+                                    await websocket.send(json.dumps({"action": "clear_buffer"}))
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                print(f"⚠️ Ошибка в WebSocket приеме: {e}")
+                                break
+    finally:
+        input_task.cancel()
 
 async def main_ws():
     print(f"🔗 Подключение к WebSocket: {WS_URL}...")
@@ -340,7 +388,20 @@ async def main_ws():
 
 if __name__ == "__main__":
     if args.prompt is not None:
+        # Обрабатываем начальный текстовый промпт
         stream_to_tts(args.prompt, None)
+
+        # Переходим в непрерывный текстовый чат-режим
+        print("\n⌨️ Текстовый режим активен. Продолжайте общение (для выхода введите 'exit' или нажмите Ctrl+C):")
+        try:
+            while True:
+                user_input = input("Вы: ").strip()
+                if user_input.lower() in ("exit", "quit", "выход"):
+                    break
+                if user_input:
+                    stream_to_tts(user_input, None)
+        except KeyboardInterrupt:
+            print("\n⏹️ Завершено пользователем.")
     else:
         try:
             asyncio.run(main_ws())
